@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 app = Flask(__name__)
 
 LINK_SECRET = os.environ.get("LINK_SECRET", "REPLACE_THIS_WITH_YOUR_RANDOM_SECRET")
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "8874548208:AAFEem3izh6Uagr8rkHRV5yoNMNJ3ol2B90")
 OWNER_ID    = os.environ.get("OWNER_ID", "5748713981")
 DB_PATH     = os.environ.get("DB_PATH", "zerx.db")
 
