@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from functools import wraps
 
 app = Flask(__name__)
+_CLONES = {}
 
 LINK_SECRET = os.environ.get("LINK_SECRET", "REPLACE_THIS_WITH_YOUR_RANDOM_SECRET")
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
@@ -54,18 +55,44 @@ def api_verify():
         return jsonify({"ok": False, "reason": "bad_signature"}), 403
     return jsonify({"ok": True, "uid": uid})
 
+@app.route("/api/clone-store", methods=["POST"])
+def clone_store():
+    try:
+        data = request.get_json(force=True) or {}
+        slug = data.get("slug", "")
+        html = data.get("html", "")
+        if not slug or not html:
+            return jsonify({"ok": False}), 400
+        _CLONES[slug] = html
+        try:
+            con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
+            con.execute("""CREATE TABLE IF NOT EXISTS clone_html(
+                             slug TEXT PRIMARY KEY, html TEXT, created TEXT)""")
+            con.execute("INSERT OR REPLACE INTO clone_html(slug,html,created) VALUES(?,?,?)",
+                        (slug, html, datetime.now(timezone.utc).isoformat()))
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route("/api/clone/<slug>", methods=["GET"])
 def api_clone(slug):
+    html = _CLONES.get(slug)
+    if html:
+        return Response(html, mimetype="text/html; charset=utf-8")
     try:
         con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
         con.row_factory = sqlite3.Row
         row = con.execute("SELECT html FROM clone_html WHERE slug=?", (slug,)).fetchone()
         con.close()
+        if row:
+            return Response(row["html"], mimetype="text/html; charset=utf-8")
     except Exception:
-        return "DB error", 500
-    if not row:
-        return "Not found", 404
-    return Response(row["html"], mimetype="text/html; charset=utf-8")
+        pass
+    return "Not found", 404
 
 @app.route("/track", methods=["POST", "OPTIONS"])
 def track():
